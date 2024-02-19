@@ -1,0 +1,136 @@
+# -*- coding: utf-8 -*-
+"""
+
+@author: HL.G
+"""
+
+#The input file of this code is the Sentinel-3 OLCI image after MUMM atmospheric correction.
+#It mainly includes Rayleigh corrected Rrc data and remote sensing reflectance Rrs data.
+
+
+import os
+import numpy as np
+from osgeo import gdal
+
+#QAA-750E
+
+def calculate_aph_674(band24, band27, band29, band30, band33):
+    rrs_443 = band24 / (0.52 + 1.7 * band24)
+    rrs_560 = band27 / (0.52 + 1.7 * band27)
+    rrs_665 = band29 / (0.52 + 1.7 * band29)
+    rrs_674 = band30 / (0.52 + 1.7 * band30)
+    rrs_754 = band33 / (0.52 + 1.7 * band33)
+
+    u_665 = (-0.084 + (0.007056 + 0.68 * rrs_665) ** 0.5) / 0.34
+    u_674 = (-0.084 + (0.007056 + 0.68 * rrs_674) ** 0.5) / 0.34
+    u_754 = (-0.084 + (0.007056 + 0.68 * rrs_754) ** 0.5) / 0.34
+
+    a_754 = 2.45   
+
+    bbp_754 = (u_754 * a_754) / (1 - u_754) - 0.000203
+
+    Y = 3.99 - 3.59 * np.exp(-0.9 * rrs_443 / rrs_560)
+
+    bb_665 = bbp_754 * (754 / 665) ** Y + 0.000337
+    bb_674 = bbp_754 * (754 / 674) ** Y + 0.000319
+
+    anw_665 = (1 - u_665) * bb_665 / u_665 - 0.429
+    anw_674 = (1 - u_674) * bb_674 / u_674 - 0.4459
+
+    aph_674 = (anw_674 - 0.882 * anw_665) / 0.26
+
+    return aph_674          
+
+# Input folder path and Output folder path
+
+input_folder ='Input folder path'
+output_folder ='Output folder path'
+shapefile_path =  "Study area.shp" 
+
+
+
+# Get the paths of all images in a folder
+image_paths = [os.path.join(input_folder, filename) for filename in os.listdir(input_folder) if filename.endswith(".tif")]
+
+# Loop through each image
+for image_path in image_paths:
+    dataset = gdal.Open(image_path)
+    band7 = dataset.GetRasterBand(7).ReadAsArray()
+    band8 = dataset.GetRasterBand(8).ReadAsArray()
+    band10 = dataset.GetRasterBand(10).ReadAsArray()
+    band11 = dataset.GetRasterBand(11).ReadAsArray()
+    band12 = dataset.GetRasterBand(12).ReadAsArray()
+    
+    band24 = dataset.GetRasterBand(24).ReadAsArray()
+    band27 = dataset.GetRasterBand(27).ReadAsArray()
+    band28 = dataset.GetRasterBand(28).ReadAsArray()
+    band29 = dataset.GetRasterBand(29).ReadAsArray()
+    band30 = dataset.GetRasterBand(30).ReadAsArray()
+    band31 = dataset.GetRasterBand(31).ReadAsArray()
+    band32 = dataset.GetRasterBand(32).ReadAsArray()
+    band33 = dataset.GetRasterBand(33).ReadAsArray()
+    
+    # Calculate aph_674  
+    aph_674 = calculate_aph_674(band24, band27, band29, band30, band33)
+    
+    # create the output array
+    N_density = np.zeros(aph_674.shape, dtype=np.float32)
+    
+    #Determination of pixel water body type
+
+    W_681 = band10 - band8 - (band11 - band8) * (681 - 665) / (709 - 665) 
+    W_665 = band8 - band7 - (band10 - band7) * (665 - 620) / (681 - 620)
+    bloom = ((band12 - band10) / (band12 + band10)) > 0     #Blooms
+    
+    condition_1 = (W_681 < 0) & (W_665 > 0) & (~bloom)   # cyanobacteria-dominated 
+    condition_2 = ~(condition_1 | bloom)    # non-cyanobacteria-dominated
+    
+    
+    # Algae density estimation formula
+    
+    Qa_674 = 1 + 2 * np.exp(-0.7593 * aph_674 ** 0.3944) / (0.7593 * aph_674 ** 0.3944) + (2 * np.exp(-0.7593 * aph_674 ** 0.3944) - 2) / (0.5765 * aph_674 ** 0.7888)
+    N_cyan = (aph_674 ** 1.8863 / (0.2546 * 10 ** (-10) * Qa_674))/1000      # cyanobacteria-dominated formula
+
+    Qa_674 = 1 + 2 * np.exp(-1.3113 * aph_674 ** 0.7852) / (1.3113 * aph_674 ** 0.7852) + (2 * np.exp(-1.3113 * aph_674 ** 0.7852) - 2) / (1.7195 * aph_674 ** 1.5704)
+    N_noncya = (aph_674 ** 2.7645 / (0.2877 * 10 ** (-10) * Qa_674))/1000   # non-cyanobacteria-dominated formula
+       
+
+    
+    N_density[condition_1] = N_cyan[condition_1]
+    N_density[condition_2] = N_noncya[condition_2]
+    N_density[bloom] = np.nan
+    
+    
+    #Eliminate outliers,samples within 2 billion 
+
+    N_density[condition_1]=np.where(N_density[condition_1]<=2000000000, N_density[condition_1], np.nan)
+    N_density[condition_2]=np.where(N_density[condition_2]<=2000000000, N_density[condition_2], np.nan)
+
+    # Extract image name
+    image_name = os.path.splitext(os.path.basename(image_path))[0]
+
+    # output file path
+    output_file = os.path.join(output_folder, image_name + "_ad.tif")
+
+
+    # output image
+    driver = gdal.GetDriverByName("GTiff")
+    output_dataset = driver.Create(output_file, dataset.RasterXSize, dataset.RasterYSize, 1, gdal.GDT_Float32)
+    output_dataset.SetProjection(dataset.GetProjection())
+    output_dataset.SetGeoTransform(dataset.GetGeoTransform())
+
+    # Write results to output image
+    output_band = output_dataset.GetRasterBand(1)
+    output_band.WriteArray(N_density)
+
+    # Save and close output image
+    output_band.FlushCache()
+    output_dataset = None
+
+    #  Crop image
+    inputimage_path=output_file
+    outputimage_path=os.path.join(output_folder, image_name + "_cro.tif")
+    input_shp = shapefile_path
+    gdal.Warp(outputimage_path,inputimage_path,cutlineDSName=input_shp,dstNodata=np.nan,cropToCutline = True)
+    print('completed')
+    os.remove(output_file)
